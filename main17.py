@@ -97,7 +97,7 @@ user_memory_map = {}
 file_doc_memory_map = {}
 code_memory_map = {}
 
-local_embedding_model = SentenceTransformer('all-mpnet-base')
+local_embedding_model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
 
 load_dotenv()
 
@@ -3235,7 +3235,7 @@ async def load_faiss_indices():
     except Exception as e:
         logging.error(f"Error loading FAISS index: {e}", exc_info=True)
 
-
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
