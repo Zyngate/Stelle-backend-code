@@ -25,6 +25,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
     Response,
+    Body
 )
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from urllib.parse import unquote, urlparse, parse_qs
 from dotenv import load_dotenv
 from pywebpush import webpush, WebPushException
+from fastapi.encoders import jsonable_encoder
 
 import docx2txt
 import fitz
@@ -52,6 +54,11 @@ from pydantic import BaseModel
 from fastapi import HTTPException
 from html2image import Html2Image
 from enum import Enum
+from typing import Any, Dict
+import logging
+import datetime
+from datetime import timedelta, timezone
+
 
 # Environment and Logging Setup
 logging.basicConfig(
@@ -72,7 +79,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # Global Error Handler
 @app.exception_handler(Exception)
@@ -244,6 +250,37 @@ def convert_object_ids(document: dict) -> dict:
             ]
     return document
 
+# -------------------- Groq AI Call --------------------
+async def groq_chat_completion(messages, model="llama-3.3-70b-versatile", temperature=0.7):
+    api_key = os.getenv("GROQ_API_KEY_PLANNING")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY_PLANNING not configured")
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 4000,  # ⬅️ increase this to allow longer JSON
+        "response_format": {"type": "json_object"}  # ensures valid JSON output
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:  # ⬅️ slightly higher timeout
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"Groq API request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Groq API request failed: {str(e)}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Groq API returned error: {e.response.text}")
+        raise HTTPException(status_code=e.response.status_code, detail=f"Groq API error: {e.response.text}")
 
 def extract_code_segments(code: str) -> list:
     segments = []
@@ -279,87 +316,140 @@ def split_text_into_chunks(
             break
     return chunks
 
+import asyncio
+import logging
+from ratelimit import limits, sleep_and_retry
 
-# In main16.py, add these functions, for example, after the "Utility Functions" section
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
-async def generate_seed_keywords(query: str) -> list:
-    """Generate 3 seed keywords from the user's query."""
-    prompt = f"Generate 8 seed keywords based on the following query: {query}. Separate the keywords with commas. Must output only kewords nothing else"
-    # Use the existing 'client' from main16.py
-    completion = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="deepseek-r1-distill-llama-70b",
+
+# -------------------------------
+# Rate-limited Groq wrapper (async)
+# -------------------------------
+@sleep_and_retry
+@limits(calls=CALLS_PER_MINUTE, period=PERIOD)
+async def rate_limited_groq_call(client, *args, **kwargs):
+    """Rate-limited wrapper for AsyncGroq client (async)."""
+    return await client.chat.completions.create(*args, **kwargs)
+
+
+# -------------------------------
+# 1️⃣ Generate Seed Keywords
+# -------------------------------
+async def generate_seed_keywords(query: str, client) -> list:
+    prompt = (
+        f"Generate 3 seed keywords based on the following query: {query}. "
+        "Separate the keywords with commas. Output only keywords."
+    )
+
+    completion = await rate_limited_groq_call(
+        client,
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.6,
         max_completion_tokens=1024,
         reasoning_format="hidden",
     )
+
     response = completion.choices[0].message.content
-    seed_keywords = response.split(", ")
+    seed_keywords = [kw.strip() for kw in response.split(",") if kw.strip()]
+
     if len(seed_keywords) != 3:
-        # It's better to handle this gracefully than to raise a ValueError in a production app
-        # For instance, you could try to split by comma, or return the first 3 words.
-        # For this integration, we'll keep the logic but you may want to refine it.
-        logger.warning(
-            f"Expected 3 seed keywords, but got {len(seed_keywords)}. Using what was returned."
-        )
+        logger.warning(f"Expected 3 seed keywords, got {len(seed_keywords)}. Adjusting...")
+        seed_keywords = (seed_keywords + [""] * 3)[:3]
+
     return seed_keywords
 
 
-async def fetch_trending_hashtags(seed_keywords: list) -> list:
-    """Fetch up to 5 trending hashtags per seed keyword."""
+# -------------------------------
+# 2️⃣ Fetch Trending Hashtags
+# -------------------------------
+async def fetch_trending_hashtags(seed_keywords: list, internet_client) -> list:
     hashtags = []
+
     for keyword in seed_keywords:
-        prompt = f"Browse intagram ,X and reddit and fetch the hastags related to {keyword} make sure those keywords trending and have potential to boost SEO. Only provide the thirty different hashtags separated by spaces. Must output only hastags nothing else"
-        # Use the existing 'internet_client' for Browse tasks
-        completion = await asyncio.to_thread(
-            internet_client.chat.completions.create,
-            model="OpenAI-Agent",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=1,
-            max_completion_tokens=3000,
-            stream=False,
+        prompt = (
+            f"Browse Instagram, X (Twitter), and Reddit, and fetch hashtags related to {keyword}. "
+            "Ensure they are trending and can boost SEO. Provide up to 30 unique hashtags separated by spaces."
         )
-        response = completion.choices[0].message.content
-        keyword_hashtags = response.split(" ")
-        hashtags.extend(keyword_hashtags)
-    return list(set(hashtags))[:30]  # Limit to 30 unique hashtags
 
-
-async def fetch_seo_keywords(seed_keywords: list) -> list:
-    """Fetch up to 5 SEO keywords per seed keyword."""
-    seo_keywords = []
-    for keyword in seed_keywords:
-        prompt = f"Go to internet and see the tob blogs and posts related to {keyword}. Only provide the keywords separated by commas. Must output only kewords nothing else"
-        # Use the existing 'internet_client' for Browse tasks
-        completion = await asyncio.to_thread(
-            internet_client.chat.completions.create,
-            model="compound-beta-mini",
+        completion = await rate_limited_groq_call(
+            internet_client,
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=1,
             max_completion_tokens=1024,
         )
+
         response = completion.choices[0].message.content
-        keyword_seo = response.split(", ")[:5]
-        seo_keywords.extend(keyword_seo)
-    return list(set(seo_keywords))[:15]  # Limit to 15 unique keywords
+        keyword_hashtags = [
+            ht.strip() for ht in response.replace("\n", " ").split(" ") if ht.strip()
+        ]
+        hashtags.extend(keyword_hashtags)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_hashtags = []
+    for ht in hashtags:
+        if ht not in seen:
+            seen.add(ht)
+            unique_hashtags.append(ht)
+
+    return unique_hashtags[:30]
 
 
+# -------------------------------
+# 3️⃣ Fetch SEO Keywords
+# -------------------------------
+async def fetch_seo_keywords(seed_keywords: list, internet_client) -> list:
+    seo_keywords = []
+
+    for keyword in seed_keywords:
+        prompt = (
+            f"Go to internet and see the top blogs and posts related to {keyword}. "
+            "Only provide keywords separated by commas. Output only keywords."
+        )
+
+        completion = await rate_limited_groq_call(
+            internet_client,
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=1,
+            max_completion_tokens=512,
+        )
+
+        response = completion.choices[0].message.content
+        keyword_seo = [kw.strip() for kw in response.split(",") if kw.strip()]
+        seo_keywords.extend(keyword_seo[:5])
+
+    # Preserve order while removing duplicates
+    return list(dict.fromkeys(seo_keywords))[:15]
+
+
+# -------------------------------
+# 4️⃣ Generate Caption
+# -------------------------------
 async def generate_caption(
-    query: str, seed_keywords: list, trending_hashtags: list, seo_keywords: list
+    query: str, seed_keywords: list, trending_hashtags: list, seo_keywords: list, client
 ) -> str:
-    """Generate a caption with a hook using query, keywords, hashtags, and SEO terms."""
-    prompt = f"Write a good caption with a starting hook for social media content about {query}. Use the following seed keywords: {', '.join(seed_keywords)}. Incorporate some of these trending hashtags: {', '.join(trending_hashtags)}. Also, consider these SEO keywords: {', '.join(seo_keywords)}. make sure caption is almost 50 words long and does not include m-dash(—)"
-    # Use the existing 'client' for generation
-    completion = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="deepseek-r1-distill-llama-70b",
+    prompt = (
+        f"Write a caption with a starting hook for social media content about {query}. "
+        f"Use seed keywords: {', '.join(seed_keywords)}. "
+        f"Incorporate trending hashtags: {', '.join(trending_hashtags)}. "
+        f"Consider SEO keywords: {', '.join(seo_keywords)}. "
+        "Keep it around 50 words and avoid em dash (—)."
+    )
+
+    completion = await rate_limited_groq_call(
+        client,
+        model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.6,
         max_completion_tokens=1024,
-        reasoning_format="raw",
     )
+
     return completion.choices[0].message.content
 
 
@@ -444,59 +534,75 @@ class PostGenOptions(str, Enum):
     Video = "video"
 
 # New pydantic models
-# class Task(BaseModel):
-
-#     task_id: str
-#     title: str
-#     status: str
-#     deadline: Optional[str] = None
-
-
-# class Goal(BaseModel):
-#     goal_id: str
-#     title: str
-#     description: str
-#     status: str
-#     tasks: List[Task]
+class Task(BaseModel):
+    task_id: str
+    title: str
+    status: str
+    deadline: Optional[str] = None
 
 
-# class PlanWeekRequest(BaseModel):
-#     user_id: str
-#     planning_horizon_weeks: Optional[int] = 4  # Default to 4 weeks
+class SubTask(BaseModel):
+    title: str
+    description: str
 
 
-# class SubTask(BaseModel):
-#     title: str
-#     description: str
+class PlannedTask(BaseModel):
+    task_id: str
+    title: str
+    status: str
+    description: str
+    sub_tasks: List[SubTask]
 
 
-# class PlannedTask(BaseModel):
-#     task_id: str
-#     title: str
-#     status: str
-#     description: str
-#     sub_tasks: List[SubTask]
+# ------------------ Planning Models ------------------
+
+class DayPlan(BaseModel):
+    date: str
+    day_of_week: str
+    daily_focus: str
+    tasks: List[PlannedTask]
 
 
-# class DayPlan(BaseModel):
-#     date: str
-#     day_of_week: str
-#     daily_focus: str
-#     tasks: List[PlannedTask]
+class WeeklyPlan(BaseModel):
+    week_number: int
+    week_start_date: str
+    week_end_date: str
+    strategic_focus: str
+    days: List[DayPlan]
 
 
-# class WeeklyPlan(BaseModel):
-#     week_number: int
-#     week_start_date: str
-#     week_end_date: str
-#     strategic_focus: str
-#     days: List[DayPlan]
+class MultiWeekPlanResponse(BaseModel):
+    overall_strategic_approach: str
+    planning_horizon_weeks: int
+    weekly_plans: List[WeeklyPlan]
 
 
-# class MultiWeekPlanResponse(BaseModel):
-#     overall_strategic_approach: str
-#     planning_horizon_weeks: int
-#     weekly_plans: List[WeeklyPlan]
+# ------------------ Request Models ------------------
+
+class PlanWeekRequest(BaseModel):
+    user_id: str
+    planning_horizon_weeks: int = 4
+
+
+class RegisterUserRequest(BaseModel):
+    user_id: str
+    time_zone: str = "UTC"
+
+
+class CreateGoalRequest(BaseModel):
+    user_id: str
+    goal_title: str
+    goal_description: str
+    goal_duration_weeks: int = 4
+
+
+# ------------------ Goal Model ------------------
+
+class Goal(BaseModel):
+    title: str
+    description: str
+    status: str
+    tasks: List[Task]
 
 # # new code - Mohit
 # def calculate_planning_horizon(goals_data: List[Dict]) -> int:
@@ -842,6 +948,7 @@ async def store_long_term_memory(user_id: str, session_id: str, new_messages: li
         logging.error(f"Error storing long-term memory: {e}", exc_info=True)
 
 
+
 # Push Notification System Implementation
 @app.post("/subscribe")
 async def subscribe(subscription: Subscription):
@@ -1053,13 +1160,11 @@ async def schedule_immediate_reminder(user_id: str, reminder_text: str):
     logging.info(f"Immediate reminder scheduled for user {user_id}: {reminder_text}")
 
 
-# Rate limiting for Groq calls
-@sleep_and_retry
-@limits(calls=CALLS_PER_MINUTE, period=PERIOD)
-async def rate_limited_groq_call(*args, **kwargs):
-    return await asyncio.to_thread(
-        deepsearch_client.chat.completions.create, *args, **kwargs
-    )
+
+
+
+
+
 
 
 async def clarify_query(query: str) -> str:
@@ -1084,21 +1189,24 @@ async def clarify_query(query: str) -> str:
 
 async def clarify_response(query: str) -> str:
     prompt = (
-        "You are an expert person who unerstands the user and return that what you understand by user querry and what is your next steps to adress the answers to querry. also make sure your response is in proper slack markdown "
-        "into the most effective,  considering the user's context.\n"
+        "You are an expert person who understands the user and returns what you understand by the user's query, "
+        "and what your next steps would be to address the query. Make sure your response is in proper Slack markdown.\n"
         f"Original query: {query}\n"
     )
     try:
         response = await rate_limited_groq_call(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": prompt}],
-            max_tokens=900,
-            temperature=0.6,
-        )
+                   client,
+                   model="llama-3.3-70b-versatile",
+                   messages=[{"role": "system", "content": prompt}],
+                   max_tokens=900,
+                   temperature=0.6,
+                 )
+
         return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"Error clarifying query: {e}")
-        return clarify_response
+        return f"Unable to clarify query due to an internal error. Proceeding with the original query: {query}"
+
 
 
 async def generate_keywords(clarified_query: str) -> List[str]:
@@ -1152,75 +1260,107 @@ async def understanding_query(clarify_response: str) -> List[str]:
         return [understanding_query]
 
 
-async def deep_search(query_data: Dict[str, str], websocket: WebSocket):
-    user_id = query_data["user_id"]
-    session_id = query_data["session_id"]
-    main_query = query_data["prompt"]
-    filenames = query_data["filenames"]
+async def deep_search(query_data: Dict[str, Any], websocket: WebSocket):
+    user_id = query_data.get("user_id", "unknown")
+    session_id = query_data.get("session_id", "unknown")
+    main_query = query_data.get("prompt", "No query provided")
+    filenames = query_data.get("filenames", [])
 
     try:
-        await websocket.send_json(
-            {"step": "start", "message": "Starting deep search..."}
-        )
+        # Start
+        try:
+            await websocket.send_json({"step": "start", "message": "Starting deep search..."})
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at start.")
+            return "Client disconnected"
 
-        # Fetch memory summary
-        mem_entry = await memory_collection.find_one({"user_id": user_id})
-        memory_summary = mem_entry.get("summary", "") if mem_entry else ""
+        # Memory summary
+        try:
+            mem_entry = await memory_collection.find_one({"user_id": user_id})
+            memory_summary = mem_entry.get("summary", "") if mem_entry else ""
+        except Exception as e:
+            logging.error(f"Memory fetch failed: {e}")
+            memory_summary = "No memory summary available."
 
         # Clarify query
-        clarified_query = await clarify_query(main_query)
-        clarifyd_response = await clarify_response(main_query)
-        await websocket.send_json(
-            {
+        try:
+            clarified_query = await clarify_query(main_query)
+        except Exception as e:
+            logging.warning(f"clarify_query failed: {e}")
+            clarified_query = main_query
+
+        try:
+            clarified_response = await clarify_response(main_query)
+        except Exception as e:
+            logging.warning(f"clarify_response failed: {e}")
+            clarified_response = clarified_query
+
+        try:
+            await websocket.send_json({
                 "step": "clarified_query",
-                "message": f"Clarified response: {clarifyd_response}",
-            }
-        )
+                "message": f"Clarified response: {clarified_response}",
+            })
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at clarified_query.")
+            return "Client disconnected"
 
         # Generate keywords
-        keywords = await generate_keywords(clarified_query)
-        understanding = await understanding_query(clarified_query)
-        await websocket.send_json(
-            {
+        try:
+            keywords = await generate_keywords(clarified_query)
+        except Exception as e:
+            logging.warning(f"generate_keywords failed: {e}")
+            keywords = clarified_query.split()
+
+        try:
+            understanding = await understanding_query(clarified_query)
+        except Exception as e:
+            logging.warning(f"understanding_query failed: {e}")
+            understanding = "Understanding generated using fallback."
+
+        try:
+            await websocket.send_json({
                 "step": "keywords_generated",
                 "message": f"Processing request: {understanding}",
-            }
-        )
+            })
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at keywords_generated.")
+            return "Client disconnected"
 
+        # Fetch info for each keyword
         all_responses = []
         all_sources = []
+
         for keyword in keywords:
-            response, sources = await query_internet_via_groq(
-                f"Provide information on {keyword}", return_sources=True
-            )
-            if response and response != "Error accessing internet information.":
-                all_responses.append(response)
-                all_sources.extend(sources)
-                await websocket.send_json(
-                    {
-                        "step": "response_received",
-                        "keyword": keyword,
-                        "response": (
-                            response[:200] + "..." if len(response) > 200 else response
-                        ),
-                        "sources": [
-                            source["url"] for source in sources
-                        ],  # Modified to send only URLs
-                    }
+            try:
+                response, sources = await query_internet_via_groq(
+                    f"Provide information on {keyword}", return_sources=True
                 )
+                if response and response != "Error accessing internet information.":
+                    all_responses.append(response)
+                    all_sources.extend(sources)
+                    try:
+                        await websocket.send_json({
+                            "step": "response_received",
+                            "keyword": keyword,
+                            "response": response[:200] + "..." if len(response) > 200 else response,
+                            "sources": [source.get("url", "N/A") for source in sources],
+                        })
+                    except WebSocketDisconnect:
+                        logging.warning("Client disconnected during response_received.")
+                        return "Client disconnected"
+                else:
+                    all_responses.append(f"No real data found for {keyword}. Using fallback info.")
+            except Exception as e:
+                logging.warning(f"Keyword search failed for '{keyword}': {e}")
+                all_responses.append(f"Failed to fetch info for {keyword}. Using fallback info.")
 
         if not all_responses:
-            await websocket.send_json(
-                {"step": "no_content", "message": "No information retrieved."}
-            )
-            return
+            all_responses = [f"No information retrieved. Using fallback response for: {main_query}"]
 
         # Synthesize final answer
         combined_responses = "\n\n".join(all_responses)
-        prompt = (
-            f"Based on the following information, provide a detailed and insightful answer to the query:\n"
-            f"'{main_query}'\n\nInformation:\n{combined_responses}"
-        )
+        prompt = f"Based on the following info, provide an answer to:\n'{main_query}'\n\nInfo:\n{combined_responses}"
+
         try:
             completion = await rate_limited_groq_call(
                 model="llama-3.1-8b-instant",
@@ -1229,32 +1369,33 @@ async def deep_search(query_data: Dict[str, str], websocket: WebSocket):
                 temperature=0.7,
             )
             final_answer = completion.choices[0].message.content.strip()
-            # Remove duplicate sources based on URL
-            unique_sources = [
-                source["url"]
-                for source in {source["url"]: source for source in all_sources}.values()
-            ]
-            await websocket.send_json(
-                {
-                    "step": "final_answer",
-                    "message": final_answer,
-                    "sources": unique_sources,  # Modified to send only URLs
-                }
-            )
         except Exception as e:
-            logging.error(f"Error synthesizing final answer: {e}")
-            await websocket.send_json(
-                {"step": "error", "message": "Error generating final answer."}
-            )
+            logging.warning(f"rate_limited_groq_call failed: {e}")
+            final_answer = f"Fallback answer:\n{combined_responses}"
 
-        await websocket.send_json({"step": "end", "message": "Deep search complete!"})
-        return final_answer  # Return final_answer for use in WebSocket endpoint
+        # Remove duplicate sources
+        unique_sources = list({source.get("url", "N/A"): source for source in all_sources}.values())
+
+        try:
+            await websocket.send_json({
+                "step": "final_answer",
+                "message": final_answer,
+                "sources": unique_sources,
+            })
+            await websocket.send_json({"step": "end", "message": "Deep search complete!"})
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at final_answer.")
+            return "Client disconnected"
+
+        return final_answer
+
     except Exception as e:
         logging.error(f"Deep search error: {e}")
-        await websocket.send_json(
-            {"step": "error", "message": "An unexpected error occurred."}
-        )
-        return "Error during deep search."
+        try:
+            await websocket.send_json({"step": "error", "message": "An unexpected error occurred."})
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at error message.")
+        return f"Error during deep search. Fallback answer for query: {main_query}"
 
 
 # Endpoints
@@ -1607,7 +1748,7 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
 
         stream = await client_generate.chat.completions.create(
             messages=messages,
-            model="deepseek-r1-distill-llama-70b",
+            model="openai/gpt-oss-120b",
             max_completion_tokens=4000,
             temperature=0.7,
             stream=True,
@@ -2009,6 +2150,7 @@ async def generate_response(request: Request, background_tasks: BackgroundTasks)
         )
 
 
+
 @app.get("/chat-history")
 async def get_chat_history(user_id: str = Query(...), session_id: str = Query(...)):
     try:
@@ -2216,7 +2358,7 @@ async def visual_generate_subqueries(main_query: str, num_subqueries: int = 3) -
         "Write each query on a separate line, with no numbering or additional text."
     )
     try:
-        chat_completion = client.chat.completions.create(
+        chat_completion = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             max_tokens=150,
@@ -2247,7 +2389,7 @@ async def visual_synthesize_result(
         f"'{main_query}'\n\nContent:\n{combined_content}"
     )
     try:
-        chat_completion = client.chat.completions.create(
+        chat_completion = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             max_tokens=500,
@@ -2264,12 +2406,12 @@ async def visual_synthesize_result(
 async def generate_html_visualization(content: str) -> str:
     prompt = f"Generate a complete HTML document code that presents the following research result in a professional and modern layout. The document should have a dark theme with a background color of #000000 and use the brand color #6ee2f5 for accents and interactive elements. Include interactive visualizations such as pie charts, bar graphs, or other diagrams to represent the data mentioned in the result . Use modern CSS styling to create a clean and sleek design, and ensure the layout is structured similar to an A4 sheet, with text explanations and visualizations properly aligned and if you use maintainAspectRatio make sure its true. Incorporate interactive features like hover effects, clickable elements, or animations to enhance user engagement. Output only the HTML code, with all styles and scripts included in the file. Result: '{content}'"
     try:
-        chat_completion = client.chat.completions.create(
+        chat_completion = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="deepseek-r1-distill-llama-70b",
+            model="llama-3.3-70b-versatile",
             max_tokens=8000,
             temperature=0.8,
-            reasoning_format="hidden",
+           
         )
         html_code = chat_completion.choices[0].message.content.strip()
         logger.info("Generated HTML visualization code.")
@@ -2502,6 +2644,7 @@ async def start_deepsearch(request: DeepSearchRequest):
     return {"query_id": query_id}
 
 
+# WebSocket endpoint
 @app.websocket("/ws/deepsearch/{query_id}")
 async def deepsearch_websocket_endpoint(websocket: WebSocket, query_id: str):
     await websocket.accept()
@@ -2511,67 +2654,60 @@ async def deepsearch_websocket_endpoint(websocket: WebSocket, query_id: str):
             await websocket.send_json({"step": "error", "message": "Invalid query ID"})
             return
 
-        user_id = query_data["user_id"]
-        session_id = query_data["session_id"]
-        user_message = query_data["prompt"]
-        filenames = query_data["filenames"]
+        user_id = query_data.get("user_id")
+        session_id = query_data.get("session_id")
+        user_message = query_data.get("prompt")
+        filenames = query_data.get("filenames", [])
 
-        multimodal_context, _ = await retrieve_multimodal_context(
-            user_message, session_id, filenames
-        )
+        multimodal_context, _ = await retrieve_multimodal_context(user_message, session_id, filenames)
         research_needed = "research"
 
         if research_needed == "research" and not multimodal_context:
             final_answer = await deep_search(query_data, websocket)
+
             user_embedding = await generate_text_embedding(user_message)
             assistant_embedding = await generate_text_embedding(final_answer)
+
             new_messages = [
                 {"role": "user", "content": user_message, "embedding": user_embedding},
-                {
-                    "role": "assistant",
-                    "content": final_answer,
-                    "embedding": assistant_embedding,
-                },
+                {"role": "assistant", "content": final_answer, "embedding": assistant_embedding},
             ]
-            chat_entry = await chats_collection.find_one(
-                {"user_id": user_id, "session_id": session_id}
-            )
+
+            chat_entry = await chats_collection.find_one({"user_id": user_id, "session_id": session_id})
             if chat_entry:
                 await chats_collection.update_one(
                     {"user_id": user_id, "session_id": session_id},
-                    {
-                        "$push": {"messages": {"$each": new_messages}},
-                        "$set": {
-                            "last_updated": datetime.datetime.now(datetime.timezone.utc)
-                        },
-                    },
+                    {"$push": {"messages": {"$each": new_messages}},
+                     "$set": {"last_updated": datetime.datetime.now(datetime.timezone.utc)}}
                 )
             else:
-                await chats_collection.insert_one(
-                    {
-                        "user_id": user_id,
-                        "session_id": session_id,
-                        "messages": new_messages,
-                        "last_updated": datetime.datetime.now(datetime.timezone.utc),
-                    }
-                )
+                await chats_collection.insert_one({
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "messages": new_messages,
+                    "last_updated": datetime.datetime.now(datetime.timezone.utc),
+                })
+
             if chat_entry and len(chat_entry.get("messages", [])) >= 10:
-                await store_long_term_memory(
-                    user_id, session_id, chat_entry["messages"][-10:]
-                )
+                await store_long_term_memory(user_id, session_id, chat_entry["messages"][-10:])
         else:
-            await websocket.send_json(
-                {"step": "standard_response", "message": "Using standard generation..."}
-            )
+            await websocket.send_json({"step": "standard_response", "message": "Using standard generation..."})
             await websocket.send_json({"step": "end", "message": "Response complete"})
+
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {query_id}")
+        logging.info(f"Client disconnected: {query_id}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        await websocket.send_json({"step": "error", "message": "Server error occurred"})
+        logging.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"step": "error", "message": "Server error occurred"})
+        except WebSocketDisconnect:
+            logging.warning("Client disconnected at server error.")
     finally:
         deepsearch_queries.pop(query_id, None)
-        await websocket.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 # NLP Endpoint for Real-Time Voice Conversation
@@ -2751,7 +2887,7 @@ async def nlp_websocket_endpoint(websocket: WebSocket):
 
             stream = await client_generate.chat.completions.create(
                 messages=messages,
-                model="deepseek-r1-distill-llama-70b",
+                model="llama-3.3-70b-versatile",
                 max_completion_tokens=4000,
                 temperature=0.7,
                 stream=True,
@@ -2908,8 +3044,7 @@ async def nlp_websocket_endpoint(websocket: WebSocket):
                     logging.info(f"Goal {real_goal_id} started (in progress).")
                 else:
                     logging.warning(f"Goal {real_goal_id} not found for GOAL_START.")
-
-            task_start_matches = re.findall(r"\[TASK_START: (.*?)\]", reply_content)
+                    task_start_matches = re.findall(r"\[TASK_START: (.*?)\]", reply_content)
             for tid in task_start_matches:
                 result = await goals_collection.update_one(
                     {"user_id": user_id, "tasks.task_id": tid},
@@ -3259,7 +3394,7 @@ async def regenerate_response(
 
         stream = await client_generate.chat.completions.create(
             messages=messages,
-            model="deepseek-r1-distill-llama-70b",
+            model="llama-3.3-70b-versatile",
             max_completion_tokens=4000,
             temperature=0.7,
             stream=True,
@@ -3632,180 +3767,570 @@ async def regenerate_response(
         raise HTTPException(
             status_code=500, detail="Internal error processing your request."
         )
-
-@app.post("/Plan_my_week")
-async def plan_my_week(request: PlanWeekRequest):
-    user_id = request.user_id
+        
+@app.post("/register_user")
+async def register_user(request: RegisterUserRequest = Body(...)):
+    """
+    Registers a new user with timezone.
+    Expects JSON body: {"user_id": "abc123", "time_zone": "Asia/Kolkata"}
+    """
     try:
-        # Step 1: Get user's timezone
+        pytz.timezone(request.time_zone)
+    except pytz.UnknownTimeZoneError:
+        raise HTTPException(status_code=400, detail="Invalid timezone name")
+
+    user_data = {
+        "user_id": request.user_id,
+        "time_zone": request.time_zone,
+        "created_at": datetime.datetime.now(pytz.UTC),
+    }
+
+    await users_collection.update_one(
+        {"user_id": request.user_id},
+        {"$set": user_data},
+        upsert=True
+    )
+
+    return {
+        "message": "User registered successfully",
+        "user_id": request.user_id,
+        "time_zone": request.time_zone
+    }
+
+@app.post("/create_goal")
+async def create_goal(request: CreateGoalRequest):
+    """Create a goal for a user."""
+
+    # ✅ Basic validation
+    if not request.user_id or not request.goal_title:
+        raise HTTPException(status_code=400, detail="user_id and goal_title are required")
+
+    # ✅ Check if user exists
+    user = await users_collection.find_one({"user_id": request.user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User '{request.user_id}' not found")
+
+    # ✅ Prepare goal document (with timezone-aware UTC datetimes)
+    goal_doc = {
+        "user_id": request.user_id,
+        "goal_id": str(uuid.uuid4()),
+        "session_id": str(uuid.uuid4()),
+        "title": request.goal_title,
+        "description": request.goal_description,
+        "status": "active",
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc),
+        "tasks": []  # can later be populated dynamically
+    }
+
+    # ✅ Insert into MongoDB
+    result = await goals_collection.insert_one(goal_doc)
+
+    # ✅ Convert MongoDB ObjectId to string for response
+    goal_doc["_id"] = str(result.inserted_id)
+
+    # ✅ Return JSON-safe response
+    return {
+        "message": "Goal created successfully",
+        "goal": goal_doc
+    }
+
+
+@app.post("/plan_my_weeks", response_model=MultiWeekPlanResponse)
+async def plan_my_weeks(request: PlanWeekRequest):
+    user_id = request.user_id
+    planning_weeks = request.planning_horizon_weeks
+
+    start_time = datetime.datetime.now()
+    logger.info(f"🚀 Starting weekly plan generation for user: {user_id}")
+
+    try:
+        # ---------------- Fetch user info ----------------
+        logger.info("Fetching user info...")
         user_info = await users_collection.find_one({"user_id": user_id})
-        tz_name = user_info.get("time_zone", "UTC") if user_info else "UTC"
-        try:
-            user_tz = pytz.timezone(tz_name)
-        except Exception:
-            user_tz = pytz.UTC
+        if not user_info:
+            logger.warning(f"User {user_id} not found.")
+            raise HTTPException(status_code=404, detail="User not found")
 
-        now_local = datetime.datetime.now(user_tz)
-        today = now_local.date()
+        tz_name = user_info.get("time_zone", "UTC")
+        tz = pytz.timezone(tz_name)
+        today = datetime.datetime.now(tz).date()
 
-        # Step 2: Fetch active and in-progress goals
-        goals_cursor = goals_collection.find({
-            "user_id": user_id,
-            "status": {"$in": ["active", "in progress"]}
-        })
+        # ---------------- Fetch user goals ----------------
+        logger.info(f"Fetching goals for user {user_id}...")
+        goals = await goals_collection.find({"user_id": user_id}).to_list(None)
+        logger.info(f"Fetched {len(goals)} goals successfully.")
 
-        all_goals_data = []
-        async for goal in goals_cursor:
-            all_goals_data.append(goal)
+        if not goals:
+            raise HTTPException(status_code=404, detail="No goals found for user")
 
-        if not all_goals_data:
-            raise HTTPException(status_code=404, detail="No active goals found to plan for.")
-
-        # Step 3: Prepare goals and tasks context
-        goals_summary = []
-        for goal in all_goals_data:
-            tasks_summary = []
-            for task in goal.get('tasks', []):
-                task_status = task.get('status', 'not started')
-                task_deadline_str = task.get('deadline')
-                deadline_status_info = ""
-                if task_deadline_str and task_status not in ['completed', 'cancelled']:
-                    try:
-                        deadline_dt = datetime.datetime.fromisoformat(task_deadline_str.split(' ')[0]).date()
-                        if deadline_dt < today:
-                            task_status = "Deadline Exceeded"
-                            deadline_status_info = f"(Deadline: {task_deadline_str} - EXCEEDED)"
-                        else:
-                            deadline_status_info = f"(Deadline: {task_deadline_str})"
-                    except (ValueError, TypeError):
-                        deadline_status_info = f"(Deadline: {task_deadline_str})"
-                
-                tasks_summary.append(
-                    f"    - Task: {task.get('title')} (ID: {task.get('task_id')}) "
-                    f"(Status: {task_status}) {deadline_status_info}"
-                )
-        
-            goals_summary.append(
-                f"Goal: {goal.get('title')} (ID: {goal.get('goal_id')})\n"
-                f"  Description: {goal.get('description', 'N/A')}\n"
-                f"  Tasks:\n" + "\n".join(tasks_summary)
-            )
-
-        full_context = "\n\n".join(goals_summary)
-        
-        # Step 4: Determine the current week
+        # ---------------- Prepare full context ----------------
         start_of_week = today - datetime.timedelta(days=today.weekday())
         end_of_week = start_of_week + datetime.timedelta(days=6)
-        
-        # Step 5: Construct the AI prompt
+
+        full_context_list = []
+        for g in goals:
+            goal_obj = {
+                "goal_id": g.get("goal_id"),
+                "title": g.get("goal_title", g.get("title", "Untitled Goal")),
+                "description": g.get("goal_description", g.get("description", "")),
+                "tasks": []
+            }
+
+            for t in g.get("tasks", []):
+                task_obj = {
+                    "task_id": t.get("task_id", str(uuid.uuid4())),
+                    "title": t.get("title", "Untitled Task"),
+                    "status": t.get("status", "not started"),
+                    "description": t.get("description", "No description"),
+                    "sub_tasks": []
+                }
+
+                for sub in t.get("sub_tasks", []):
+                    sub_obj = {
+                        "title": sub.get("title", "Untitled subtask"),
+                        "description": sub.get("description", "No description")
+                    }
+                    task_obj["sub_tasks"].append(sub_obj)
+
+                goal_obj["tasks"].append(task_obj)
+
+            full_context_list.append(goal_obj)
+
+        full_context_json = json.dumps(full_context_list, indent=2)
+
+        # ---------------- Build AI Prompt ----------------
+        logger.info("Building AI prompt (hardened to invent tasks if missing)...")
+        # Important: if any goal has zero tasks, the model MUST invent 3-5 actionable tasks per goal.
+        # Each generated task must be a full object with keys: task_id (string), title, status, description, sub_tasks (list of {title, description}).
+        # Distribute tasks across the planning horizon; generate full 7-day weeks. Output ONLY one valid JSON object that matches the following schema.
         prompt = f"""
-You are an expert project manager and personal coach. Your task is to create a comprehensive and strategic weekly plan for a user based on their goals.
+You are an expert project manager and personal coach. Generate a {planning_weeks}-week strategic plan.
 
 Current Date: {today.strftime('%Y-%m-%d')}
+Planning Horizon: {planning_weeks} weeks
 Current Calendar Week: {start_of_week.strftime('%Y-%m-%d')} to {end_of_week.strftime('%Y-%m-%d')}
 
-Here is the complete context of the user's current goals and tasks:
----
-{full_context}
----
+User Goals & Tasks:
+{full_context_json}
 
-Please generate a plan with the following structure in a single, valid JSON object:
+CRITICAL INSTRUCTIONS (must follow exactly):
+1) If ANY goal in the provided context has zero tasks, INVENT 3 to 5 concrete, actionable tasks for that goal. Do not leave task lists empty.
+2) Each generated task MUST be an object with these fields:
+     - "task_id": a unique string id (e.g., UUID format)
+     - "title": short descriptive title
+     - "status": one of ["not started","in progress","completed"] (use "not started" for new tasks)
+     - "description": a short, actionable 'how-to' guide for completing the task
+     - "sub_tasks": list of objects with {"title", "description"} (can be empty list)
+3) Distribute invented tasks reasonably across weeks and days; keep workload realistic (no more than a few tasks per day).
+4) Produce exactly {planning_weeks} weeks in "weekly_plans". Each week must contain 7 days (Monday-Sunday) even if tasks are empty for some days.
+5) OUTPUT ONLY a single, valid JSON object that conforms to this structure. DO NOT include explanatory text, markdown, or code fences.
+
+Example JSON structure to follow (fill values):
 {{
-  "strategic_approach": "A high-level overview for the upcoming weeks until the final goal deadline.",
-  "this_week_plan": [
-    {{
-      "date": "YYYY-MM-DD",
-      "day_of_week": "Monday",
-      "daily_focus": "Main objective for the day.",
-      "tasks": [
+    "overall_strategic_approach": "string",
+    "planning_horizon_weeks": {planning_weeks},
+    "weekly_plans": [
         {{
-          "task_id": "The original task ID.",
-          "title": "The original task title.",
-          "status": "The current status of the task.",
-          "description": "Detailed, actionable guide on HOW to complete the task.",
-          "sub_tasks": [
-            {{
-              "title": "A smaller, actionable sub-task.",
-              "description": "Detailed 'how-to' guide for this sub-task."
-            }}
-          ]
-        }}
-      ]
-    }}
-  ]
+            "week_number": 1,
+            "week_start_date": "YYYY-MM-DD",
+            "week_end_date": "YYYY-MM-DD",
+            "strategic_focus": "string",
+            "days": [
+                {{
+                    "date": "YYYY-MM-DD",
+                    "day_of_week": "Monday",
+                    "daily_focus": "string",
+                    "tasks": [
+                        {{
+                            "task_id": "string",
+                            "title": "string",
+                            "status": "not started",
+                            "description": "string",
+                            "sub_tasks": [{{"title":"string","description":"string"}}]
+                        }}
+                    ]
+                }} /* repeat 7 days */
+            ]
+        }} /* repeat for each week */
+    ]
 }}
 
-**CRITICAL RULES**:
-1. Prioritize Overdue Tasks: Any task marked "Deadline Exceeded" MUST be scheduled for the first day of the plan.
-2. Detailed 'How-To' Descriptions: Provide specific, step-by-step guidance for tasks and sub-tasks.
-3. Logical Sequencing: Schedule tasks based on dependencies and logical workflow.
-4. Full Week Plan: Generate a plan for all 7 days (Monday to Sunday). Use empty lists for days with no tasks.
-5. Output ONLY JSON: Return a single, valid JSON object.
-
-Now, create the weekly plan.
+Now generate the {planning_weeks}-week plan using the exact JSON schema above.
 """
 
-        # Step 6: Call the AI
-        try:
-            async_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY_PLANNING"))
-            response = await async_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You are an expert AI project manager. Output a single, valid JSON object."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-                temperature=0.7,
-                response_format={"type": "json_object"}
-            )
-            
-            plan_data_str = response.choices[0].message.content
-            plan_data = json.loads(plan_data_str)
+        # ---------------- Send to AI ----------------
+        logger.info("Sending prompt to AI...")
+        response = await groq_chat_completion(messages=[
+            {"role": "system", "content": "You are an expert AI project manager. Respond ONLY in JSON."},
+            {"role": "user", "content": prompt}
+        ])
+        plan_data = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.info("✅ AI response received.")
 
-            # Step 7: Save the plan to MongoDB
-            existing_plan = await weekly_plans_collection.find_one({
-                "user_id": user_id,
-                "week_start_date": start_of_week.strftime("%Y-%m-%d")
+        if not plan_data:
+            logger.error("AI returned empty response.")
+            raise HTTPException(status_code=500, detail="AI returned empty response")
+
+        # ---------------- Clean & Parse AI JSON ----------------
+        match = re.search(r"json(.*?)", plan_data, re.DOTALL)
+        if match:
+            plan_data = match.group(1).strip()
+        plan_data = plan_data.replace(",]", "]").replace(",}", "}")
+
+        try:
+            plan_json = json.loads(plan_data)
+        except json.JSONDecodeError:
+            logger.warning("⚠ AI JSON invalid, using fallback plan.")
+            plan_json = {
+                "overall_strategic_approach": "Agile iterative approach",
+                "planning_horizon_weeks": planning_weeks,
+                "weekly_plans": []
+            }
+
+    # ---------------- Normalize AI plan JSON ----------------
+        # Ensure top-level keys and canonical structure for Pydantic
+        # Support variants: AI may return 'weekly_plan' or items as strings like 'week: 2025-10-20 to 2025-10-26 - focus'
+        weeks_raw = plan_json.get("weekly_plans") or plan_json.get("weekly_plan") or []
+
+        def parse_week_string(s: str, idx: int):
+            # Ensure input is a string (AI sometimes returns integers)
+            s = "" if s is None else str(s)
+            # Try to extract start/end and focus from common formats
+            m = re.search(r"(?P<start>\d{4}-\d{2}-\d{2}).{0,30}(?:to|-).{0,30}(?P<end>\d{4}-\d{2}-\d{2}).?-?\s(?P<focus>.*)", s)
+            if m:
+                start = m.group("start")
+                end = m.group("end")
+                focus = m.group("focus").strip()
+            else:
+                # fallback dates
+                start = (today + datetime.timedelta(days=idx * 7)).isoformat()
+                end = (today + datetime.timedelta(days=idx * 7 + 6)).isoformat()
+                focus = s[:160]
+            return start, end, focus
+
+        def ensure_task_obj(task_item):
+            # Convert simple string tasks into PlannedTask-like dicts
+            if isinstance(task_item, str):
+                return {
+                    "task_id": str(uuid.uuid4()),
+                    "title": task_item,
+                    "status": "not started",
+                    "description": "",
+                    "sub_tasks": []
+                }
+            if isinstance(task_item, dict):
+                return {
+                    "task_id": task_item.get("task_id", str(uuid.uuid4())),
+                    "title": task_item.get("title", task_item.get("name", "Untitled task")),
+                    "status": task_item.get("status", "not started"),
+                    "description": task_item.get("description", ""),
+                    "sub_tasks": [
+                        {"title": st.get("title", str(st)) if isinstance(st, dict) else str(st), "description": st.get("description", "") if isinstance(st, dict) else ""}
+                        for st in (task_item.get("sub_tasks") or [])
+                    ]
+                }
+            # unknown type
+            return {
+                "task_id": str(uuid.uuid4()),
+                "title": str(task_item),
+                "status": "not started",
+                "description": "",
+                "sub_tasks": []
+            }
+
+        normalized_weeks = []
+        for i, w in enumerate(weeks_raw):
+            if isinstance(w, str):
+                start, end, focus = parse_week_string(w, i)
+                week_number = i + 1
+                # create empty 7-day structure
+                week_days = []
+                week_start_date = start
+                start_dt = datetime.datetime.fromisoformat(start)
+                for d in range(7):
+                    day_date = (start_dt + datetime.timedelta(days=d)).date()
+                    week_days.append({
+                        "date": day_date.isoformat(),
+                        "day_of_week": day_date.strftime("%A"),
+                        "daily_focus": "",
+                        "tasks": []
+                    })
+                normalized_weeks.append({
+                    "week_number": week_number,
+                    "week_start_date": week_start_date,
+                    "week_end_date": end,
+                    "strategic_focus": focus,
+                    "days": week_days
+                })
+                continue
+
+            if isinstance(w, dict):
+                # Some AI outputs embed a single 'week' string key; attempt to parse it
+                if "week" in w and not any(k in w for k in ("week_number","week_start_date","week_end_date","days")):
+                    start, end, focus = parse_week_string(w.get("week", ""), i)
+                    week_number = i + 1
+                    week_start_date = start
+                    week_end_date = end
+                    strategic_focus = focus
+                    days_raw = []
+                else:
+                    week_number = int(w.get("week_number", i + 1)) if w.get("week_number") is not None else i + 1
+                    week_start_date = w.get("week_start_date") or (today + datetime.timedelta(days=i*7)).isoformat()
+                    week_end_date = w.get("week_end_date") or (today + datetime.timedelta(days=i*7 + 6)).isoformat()
+                    strategic_focus = w.get("strategic_focus") or w.get("focus") or w.get("title") or w.get("summary") or w.get("week", "")
+                    days_raw = w.get("days", [])
+
+                # normalize days
+                if not days_raw:
+                    try:
+                        ws = week_start_date if week_start_date is not None else (today + datetime.timedelta(days=i*7)).isoformat()
+                        start_dt = datetime.datetime.fromisoformat(str(ws))
+                    except Exception:
+                        start_dt = datetime.datetime.fromisoformat((today + datetime.timedelta(days=i*7)).isoformat())
+                    week_days = []
+                    for d in range(7):
+                        day_date = (start_dt + datetime.timedelta(days=d)).date()
+                        week_days.append({
+                            "date": day_date.isoformat(),
+                            "day_of_week": day_date.strftime("%A"),
+                            "daily_focus": "",
+                            "tasks": []
+                        })
+                else:
+                    week_days = []
+                    for day in days_raw:
+                        if isinstance(day, str):
+                            # try to split "2025-10-21: focus" formats
+                            m = re.match(r"(?P<date>\d{4}-\d{2}-\d{2})[:\-\s]+(?P<focus>.*)", day)
+                            if m:
+                                d_date = m.group("date")
+                                focus = m.group("focus").strip()
+                            else:
+                                d_date = (today + datetime.timedelta(days=0)).isoformat()
+                                focus = day
+                            try:
+                                d_dt = datetime.datetime.fromisoformat(d_date).date()
+                            except Exception:
+                                d_dt = (today).isoformat()
+                            week_days.append({
+                                "date": d_dt.isoformat(),
+                                "day_of_week": datetime.datetime.fromisoformat(d_date).strftime("%A") if isinstance(d_date, str) else "",
+                                "daily_focus": focus,
+                                "tasks": []
+                            })
+                        elif isinstance(day, dict):
+                            tasks_list = []
+                            for t in (day.get("tasks") or []):
+                                tasks_list.append(ensure_task_obj(t))
+                            week_days.append({
+                                "date": day.get("date", (today).isoformat()),
+                                "day_of_week": day.get("day_of_week", ""),
+                                "daily_focus": day.get("daily_focus", ""),
+                                "tasks": tasks_list
+                            })
+                        else:
+                            week_days.append({
+                                "date": (today).isoformat(),
+                                "day_of_week": (today).strftime("%A"),
+                                "daily_focus": "",
+                                "tasks": []
+                            })
+
+                normalized_weeks.append({
+                    "week_number": week_number,
+                    "week_start_date": week_start_date,
+                    "week_end_date": week_end_date,
+                    "strategic_focus": strategic_focus,
+                    "days": week_days
+                })
+                continue
+
+            # fallback for unexpected types
+            normalized_weeks.append({
+                "week_number": i + 1,
+                "week_start_date": (today + datetime.timedelta(days=i*7)).isoformat(),
+                "week_end_date": (today + datetime.timedelta(days=i*7 + 6)).isoformat(),
+                "strategic_focus": str(w)[:160],
+                "days": [{
+                    "date": (today + datetime.timedelta(days=d)).isoformat(),
+                    "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                    "daily_focus": "",
+                    "tasks": []
+                } for d in range(7)]
             })
 
-            if existing_plan:
-                # Update existing plan
-                await weekly_plans_collection.update_one(
-                    {
-                        "user_id": user_id,
-                        "week_start_date": start_of_week.strftime("%Y-%m-%d")
-                    },
-                    {
-                        "$set": {
-                            "plan": plan_data,
-                            "updated_at": datetime.datetime.now(pytz.UTC)
-                        }
-                    }
-                )
-            else:
-                # Insert new plan
-                await weekly_plans_collection.insert_one(
-                    {
-                        "user_id": user_id,
-                        "week_start_date": start_of_week.strftime("%Y-%m-%d"),
-                        "plan": plan_data,
-                        "created_at": datetime.datetime.now(pytz.UTC),
-                        "updated_at": datetime.datetime.now(pytz.UTC)
-                    }
-                )
+        # Overwrite plan_json weekly_plans with normalized structure
+        plan_json["weekly_plans"] = normalized_weeks
+        plan_json.setdefault("planning_horizon_weeks", planning_weeks)
 
-            return plan_data
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse AI response as JSON: {str(e)}\nResponse: {plan_data_str}")
-            raise HTTPException(status_code=500, detail="Failed to generate a valid plan.")
-        except Exception as e:
-            logger.error(f"Error in /Plan_my_week endpoint: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+        # ---------------- Fallback generation if AI produced no tasks ----------------
+        def synthesize_tasks_from_goals(goals, num_tasks_per_goal=3):
+            tasks = []
+            for goal in goals:
+                goal_title = goal.get("goal_title") or goal.get("title") or ""
+                goal_desc = goal.get("goal_description") or goal.get("description") or ""
+                for j in range(num_tasks_per_goal):
+                    tasks.append({
+                        "task_id": str(uuid.uuid4()),
+                        "title": f"{goal_title} — step {j+1}" if goal_title else f"Task {j+1}",
+                        "status": "not started",
+                        "description": (goal_desc[:200] + "...") if goal_desc else "",
+                        "sub_tasks": []
+                    })
+            return tasks
+
+        # Check whether any tasks exist
+        all_empty = True
+        for wk in plan_json.get("weekly_plans", []):
+            for day in wk.get("days", []) or []:
+                if day.get("tasks"):
+                    all_empty = False
+                    break
+            if not all_empty:
+                break
+
+        if all_empty:
+            generated = synthesize_tasks_from_goals(goals, num_tasks_per_goal=3)
+            # ensure weekly_plans is a list
+            if not isinstance(plan_json.get("weekly_plans"), list):
+                plan_json["weekly_plans"] = []
+
+            # ensure at least one week exists
+            if not plan_json["weekly_plans"]:
+                plan_json["weekly_plans"].append({
+                    "week_number": 1,
+                    "week_start_date": (today).isoformat(),
+                    "week_end_date": (today + datetime.timedelta(days=6)).isoformat(),
+                    "strategic_focus": "",
+                    "days": [{
+                        "date": (today + datetime.timedelta(days=d)).isoformat(),
+                        "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                        "daily_focus": "",
+                        "tasks": []
+                    } for d in range(7)]
+                })
+
+            # ensure the first week has a days list
+            if not isinstance(plan_json["weekly_plans"][0].get("days"), list) or not plan_json["weekly_plans"][0].get("days"):
+                plan_json["weekly_plans"][0]["days"] = [{
+                    "date": (today + datetime.timedelta(days=d)).isoformat(),
+                    "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                    "daily_focus": "",
+                    "tasks": []
+                } for d in range(7)]
+
+            # Distribute generated tasks across the available weeks/days (round-robin)
+            num_weeks = len(plan_json["weekly_plans"])
+            tasks_queue = list(generated)
+            if num_weeks > 0 and tasks_queue:
+                week_idx = 0
+                day_idx = 0
+                for t in tasks_queue:
+                    week = plan_json["weekly_plans"][week_idx]
+                    days = week.get("days") or []
+                    # guard: ensure day exists
+                    if day_idx >= len(days):
+                        day_idx = 0
+                    if not days:
+                        # create 7 empty days if somehow missing
+                        week["days"] = [{
+                            "date": (today + datetime.timedelta(days=d)).isoformat(),
+                            "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                            "daily_focus": "",
+                            "tasks": []
+                        } for d in range(7)]
+                        days = week["days"]
+
+                    # ensure tasks list exists
+                    if not isinstance(days[day_idx].get("tasks"), list):
+                        days[day_idx]["tasks"] = []
+
+                    days[day_idx]["tasks"].append(t)
+
+                    # advance to next day; when we wrap, move to next week
+                    day_idx += 1
+                    if day_idx >= len(days):
+                        day_idx = 0
+                        week_idx = (week_idx + 1) % num_weeks
+                    # Final check: ensure at least one task exists after distribution
+                    has_any = False
+                    for _wk in plan_json.get("weekly_plans", []):
+                        for _day in (_wk.get("days") or []):
+                            if _day.get("tasks"):
+                                has_any = True
+                                break
+                        if has_any:
+                            break
+
+                    if not has_any:
+                        # Last-resort: force-insert generated tasks into first week/day
+                        logger.info("No tasks were added by distribution; forcing synthesized tasks into first day.")
+                        if not isinstance(plan_json.get("weekly_plans"), list) or not plan_json.get("weekly_plans"):
+                            plan_json["weekly_plans"] = [{
+                                "week_number": 1,
+                                "week_start_date": today.isoformat(),
+                                "week_end_date": (today + datetime.timedelta(days=6)).isoformat(),
+                                "strategic_focus": "",
+                                "days": [{
+                                    "date": (today + datetime.timedelta(days=d)).isoformat(),
+                                    "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                                    "daily_focus": "",
+                                    "tasks": []
+                                } for d in range(7)]
+                            }]
+
+                        if not plan_json["weekly_plans"][0].get("days"):
+                            plan_json["weekly_plans"][0]["days"] = [{
+                                "date": (today + datetime.timedelta(days=d)).isoformat(),
+                                "day_of_week": (today + datetime.timedelta(days=d)).strftime("%A"),
+                                "daily_focus": "",
+                                "tasks": []
+                            } for d in range(7)]
+
+                        plan_json["weekly_plans"][0]["days"][0]["tasks"] = generated
+
+        logger.info("Saving weekly plan to MongoDB...")
+        for i, weekly_plan in enumerate(plan_json.get("weekly_plans", [])):
+            week_number = weekly_plan.get("week_number", i + 1)  # fallback to index+1
+            week_start_date = weekly_plan.get(
+                "week_start_date",
+                (today + datetime.timedelta(days=i*7)).isoformat()
+            )
+            week_end_date = weekly_plan.get(
+                "week_end_date",
+                (today + datetime.timedelta(days=i*7 + 6)).isoformat()
+            )
+
+            logger.info(f"Writing week {week_number} to MongoDB: start={week_start_date}, end={week_end_date}")
+
+            await weekly_plans_collection.update_one(
+                {"user_id": user_id, "week_number": week_number},  # use week_number for uniqueness
+                {
+                    "$set": {**weekly_plan,
+                            "week_number": week_number,
+                            "week_start_date": week_start_date,
+                            "week_end_date": week_end_date,
+                            "updated_at": datetime.datetime.now(datetime.timezone.utc)},
+                    "$setOnInsert": {"created_at": datetime.datetime.now(datetime.timezone.utc)}
+                },
+                upsert=True
+            )
+
+
+
+        total_time = (datetime.datetime.now() - start_time).total_seconds()
+        logger.info(f"✅ Weekly plan generated for user {user_id} in {total_time:.2f}s.")
+
+        return jsonable_encoder(MultiWeekPlanResponse(**plan_json))
 
     except Exception as e:
-        logger.error(f"Error in /Plan_my_week endpoint: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-    
+        logger.error(f"❌ Error generating plan: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error generating plan: {str(e)}")
+
+
+
+
     
 # # New Plan my weeks 
 # @app.post("/Plan_my_week", response_model=MultiWeekPlanResponse)
@@ -4359,9 +4884,9 @@ async def goal_setting_endpoint(websocket: WebSocket):
 async def ai_assist(input_data: UserInput):
     """Endpoint to generate a caption based on user content description."""
     try:
-        seed_keywords = await generate_seed_keywords(input_data.query)
+        seed_keywords = await generate_seed_keywords(input_data.query,client)
         logger.info(f"Seed keywords: {seed_keywords}")
-        trending_hashtags = await fetch_trending_hashtags(seed_keywords)
+        trending_hashtags = await fetch_trending_hashtags(seed_keywords,client)
         logger.info(f"Trending hashtags: {trending_hashtags}")
         seo_keywords = await fetch_seo_keywords(seed_keywords)
         logger.info(f"SEO keywords: {seo_keywords}")
@@ -4392,14 +4917,14 @@ async def websocket_ai_assist(websocket: WebSocket):
                 json.dumps({"step": "Initializing AI Assistant..."})
             )
 
-            seed_keywords = await generate_seed_keywords(query)
+            seed_keywords = await generate_seed_keywords(query,client)
             await websocket.send_text(
                 json.dumps(
                     {"step": "Generated Seed Keywords", "keywords": seed_keywords}
                 )
             )
 
-            trending_hashtags = await fetch_trending_hashtags(seed_keywords)
+            trending_hashtags = await fetch_trending_hashtags(seed_keywords,client)
             await websocket.send_text(
                 json.dumps(
                     {"step": "Fetched Trending Hashtags", "hashtags": trending_hashtags}
@@ -4441,6 +4966,18 @@ async def websocket_ai_assist(websocket: WebSocket):
 
 
 # Post Generotar
+
+class Platforms:
+    # Order matters if you want to use indices from frontend
+    platform_list = [
+        "Facebook",
+        "LinkedIn",
+        "Instagram",
+        "Pinterest",
+        "Threads",
+        "TikTok",
+        "YouTube",
+    ]
 
 
 @app.websocket("/wss/generate-post")
@@ -4546,18 +5083,22 @@ async def websocket_generate_post(websocket: WebSocket):
                 client, prompt, seed_keywords, trending_hashtags, platform_options
             )
 
+      
+        
         await websocket.send_json(
-            {
-                "status": "completed",
-                "message": "Post Generated Successfully!",
-                "trending_hashtags": trending_hashtags,
-                "seo_keywords": seo_keywords,
-                "captions": captions,
-                "html_code": html_code,
-                "media": parsed_media,
-                "post_type": post_option_type,
-            }
-        )
+    {
+        "status": "completed",
+        "message": "Post Generated Successfully!",
+        "trending_hashtags": trending_hashtags,
+        "seo_keywords": seo_keywords,
+        "captions": captions,
+        "html_code": html_code,
+        "media": parsed_media,
+        "post_type": post_option_type,
+ 
+    }
+)
+
 
     except WebSocketDisconnect:
         logger.info("Client disconnected from /ws/generate-post")
@@ -4573,6 +5114,10 @@ async def websocket_generate_post(websocket: WebSocket):
     finally:
         await websocket.close()
         logger.info("WebSocket connection for /ws/generate-post has been closed.")
+
+
+
+
 
 
 @app.on_event("startup")
@@ -4593,8 +5138,98 @@ async def load_faiss_indices():
     except Exception as e:
         logging.error(f"Error loading FAISS index: {e}", exc_info=True)
 
+@app.get("/list-user-ids")
+async def list_user_ids():
+    try:
+        # Use distinct to get all unique user_ids
+        user_ids = await goals_collection.distinct("user_id")
+        print("All user_ids:", user_ids)  # For console verification
+        return {"user_ids": user_ids}
+    except Exception as e:
+        logging.error(f"Error fetching user IDs: {e}", exc_info=True)
+        return {"error": str(e)}
 
+#Abhinav
+SMTP_CONFIG = {
+    "server": "smtpout.secureserver.net",
+    "port": 465,  # ✅ TLS port (more reliable than 465 for GoDaddy)
+    "username": os.getenv("SMTP_USERNAME", "info@stelle.world"),
+    "password": os.getenv("SMTP_PASSWORD", "zyngate123"),
+    "from_email": os.getenv("SMTP_FROM", "info@stelle.world"),
+}
+def send_email(to_email, otp):
+    msg = EmailMessage()
+    msg.set_content(f"Your OTP is {otp}. It is valid for 5 minutes.")
+    msg["Subject"] = "Your OTP Verification Code"
+    msg["From"] = SMTP_CONFIG["from_email"]
+    msg["To"] = to_email
+
+    try:
+        # ✅ Use SSL for port 465
+        with smtplib.SMTP_SSL(SMTP_CONFIG["server"], SMTP_CONFIG["port"]) as server:
+            server.login(SMTP_CONFIG["username"], SMTP_CONFIG["password"])
+            server.send_message(msg)
+            print(f"✅ OTP email sent successfully to {to_email}")
+
+    except smtplib.SMTPAuthenticationError:
+        raise Exception("SMTP authentication failed — check username/password.")
+    except smtplib.SMTPServerDisconnected:
+        raise Exception("SMTP server disconnected unexpectedly — check port or GoDaddy settings.")
+    except Exception as e:
+        raise Exception(f"Failed to send email: {e}")
+
+@app.post("/send-otp")  # Use dash for consistency
+async def send_otp(request: OTPRequest):
+    email = request.email
+    otp = generate_otp()
+    created_at = datetime.datetime.now(timezone.utc)
+
+    await otp_collection.update_one(
+        {"email": email},
+        {"$set": {"otp": otp, "created_at": created_at}},
+        upsert=True
+    )
+
+    try:
+        send_email(email, otp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send OTP: {e}")
+
+    return {"message": f"OTP sent successfully to {email}", "success": True}
+
+# ---------------- Verify OTP ----------------
+# ...existing code...
+@app.post("/verify-otp")  # Use dash for consistency
+async def verify_otp(request: VerifyOTPRequest):
+    email = request.email
+    otp = str(request.otp)
+
+    record = await otp_collection.find_one({"email": email})
+    if not record:
+        raise HTTPException(status_code=400, detail="No OTP found for this email or it has expired")
+
+    created_at = record.get("created_at")
+    if created_at:
+        # Ensure created_at is timezone-aware (UTC)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+        if datetime.datetime.now(timezone.utc) - created_at > timedelta(minutes=5):
+            await otp_collection.delete_one({"email": email})
+            raise HTTPException(status_code=400, detail="OTP expired")
+
+    if str(record.get("otp")) != otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    await otp_collection.delete_one({"email": email})
+    return {"message": "OTP verified successfully", "success": True}
+ 
+
+    
+   
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+                    
+                   
+                    
