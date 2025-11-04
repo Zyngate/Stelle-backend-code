@@ -30,3 +30,9 @@ httpcore
 httpx
 idna
 sniffio
+win10toast
+speechrecognition
+pymongo
+duckduckgo-search
+datetime
+tkinter
