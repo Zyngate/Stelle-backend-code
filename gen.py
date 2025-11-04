@@ -14,7 +14,7 @@ from groq import Groq, AsyncGroq
 from html2image import Html2Image
 from enum import Enum
 from dotenv import load_dotenv
-
+from fastapi.staticfiles import StaticFiles
 TEMPLATES = {
     "tech": [
         """
@@ -1190,8 +1190,13 @@ app.add_middleware(
 
 logger = logging.getLogger("uvicorn.error")
 
-# Helper functions
 
+
+
+import os
+import requests
+import uuid
+from typing import List
 
 async def get_pexels_data(seed_keywords: List, media_type: str, per_page=9):
     PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY")
@@ -1233,14 +1238,16 @@ async def get_groq_client() -> AsyncGroq:
 
 
 async def classify_post_type(client: AsyncGroq, prompt: str) -> str:
+    """Classify a post as 'tech' or 'non-tech' using Groq."""
     try:
-        response = await client.chat.completions.create(
+        response = client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
                     "content": (
+                        "You are a classification model. "
                         "Classify the following post request as either 'tech' or 'non-tech'. "
-                        "Respond with exactly one word: 'tech' or 'non-tech'."
+                        "Respond with exactly one of these words only: tech or non-tech."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -1248,94 +1255,132 @@ async def classify_post_type(client: AsyncGroq, prompt: str) -> str:
             model="llama-3.3-70b-versatile",
             temperature=0.1,
         )
+
         classification = response.choices[0].message.content.strip().lower()
-        return classification if classification in ["tech", "non-tech"] else "non-tech"
+        # Clean response and normalize possible variations
+        classification = classification.replace(".", "").split()[0]
+
+        if classification not in ["tech", "non-tech"]:
+            logger.warning(f"Unexpected classification output: {classification}")
+            classification = "non-tech"
+
+        return classification
 
     except Exception as e:
         logger.error(f"Error in classifying post type: {e}")
-        return "Sorry, I couldn't classify the post"
+        return "non-tech"
 
 
-async def generate_keywords_post(client: AsyncGroq, query: str) -> List:
-    prompt = f"""Generate 3 seed keywords based on the following query: {query}. Separate the keywords with commas. 
-    Must output only keywords, nothing else."""
+import logging
+import random
+from typing import List
+from groq import AsyncGroq
+
+logger = logging.getLogger(__name__)
+
+# ✅ Recommended versatile Groq model (supports reasoning & text gen)
+MAIN_MODEL = "llama-3.1-70b-versatile"
+SECONDARY_MODEL = "llama-3.2-3b-preview"  # for smaller tasks (hashtags/SEO)
+
+
+# ✅ GROQ-READY HELPERS (using llama-3.3-70b-versatile)
+
+async def generate_keywords_post(client: AsyncGroq, query: str) -> List[str]:
+    """Generate 3–5 keywords from the input prompt."""
+    prompt = (
+        f"Generate 3 short seed keywords based on this query: '{query}'. "
+        f"Return them as a comma-separated list, nothing else."
+    )
     try:
-        completion = await client.chat.completions.create(
-            model="deepseek-r1-distill-llama-70b",
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_completion_tokens=1024,
-            reasoning_format="hidden",
+            temperature=0.5,
+            max_completion_tokens=100,
         )
         response = completion.choices[0].message.content
-        return [kw.strip() for kw in response.split(",")]
-
+        keywords = [kw.strip() for kw in response.split(",") if kw.strip()]
+        return keywords or [query]
     except Exception as e:
-        logger.error(f"Error generating seed keywords: {e}")
-        return []
+        logger.error(f"Error generating seed keywords: {e}", exc_info=True)
+        return [query]
 
 
-async def fetch_trending_hashtags_post(client: AsyncGroq, seed_keywords: List) -> List:
-    prompt = f"""Fetch 30 trending and relevant hashtags related to these keywords: {', '.join(seed_keywords)}.
-    Only provide the hashtags separated by spaces. Must output only hashtags, nothing else."""
+async def fetch_trending_hashtags_post(client: AsyncGroq, seed_keywords: List[str], platform_options: List[str]) -> List[str]:
+    """Fetch trending hashtags related to the keywords."""
+    prompt = (
+        f"Generate 20 trending hashtags related to: {', '.join(seed_keywords)} "
+        f"for platforms {', '.join(platform_options)}. "
+        f"Output hashtags separated by spaces, no explanations."
+    )
     try:
-        completion = await client.chat.completions.create(
-            model="compound-beta-mini",
+        completion =  client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=1,
-            max_completion_tokens=3000,
-            stream=False,
+            temperature=0.8,
+            max_completion_tokens=500,
         )
         response = completion.choices[0].message.content
-        return list(set(response.split(" ")))
-
+        hashtags = [tag.strip() for tag in response.split() if tag.startswith("#")]
+        return hashtags or ["#AI", "#Innovation"]
     except Exception as e:
-        logger.error(f"Error fetching hashtags: {e}")
-        return []
+        logger.error(f"Error fetching trending hashtags: {e}", exc_info=True)
+        return ["#AI", "#Innovation"]
 
 
-async def fetch_seo_keywords_post(client: AsyncGroq, seed_keywords: List):
-    prompt = f"""Based on top blogs and posts related to {', '.join(seed_keywords)}, provide 15 top SEO keywords. 
-    Only provide the keywords separated by commas. Must output only keywords, nothing else."""
+async def fetch_seo_keywords_post(client: AsyncGroq, seed_keywords: List[str]) -> List[str]:
+    """Generate SEO keywords from the main topic."""
+    prompt = (
+        f"Provide 10 SEO-friendly keywords related to: {', '.join(seed_keywords)}. "
+        f"Output them as a comma-separated list, no other text."
+    )
     try:
-        completion = await client.chat.completions.create(
-            model="compound-beta-mini",
+        completion =  client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            temperature=1,
+            temperature=0.7,
+            max_completion_tokens=200,
         )
         response = completion.choices[0].message.content
-        return list(set([kw.strip() for kw in response.split(",")]))
-
+        seo_keywords = [kw.strip() for kw in response.split(",") if kw.strip()]
+        return seo_keywords or seed_keywords
     except Exception as e:
-        logger.error(f"Error fetching SEO keywords: {e}")
-        return []
+        logger.error(f"Error fetching SEO keywords: {e}", exc_info=True)
+        return seed_keywords
 
 
 async def generate_caption_post(
     client: AsyncGroq,
     query: str,
-    seed_keywords: List,
-    trending_hashtags: List,
-    seo_keywords: List,
-):
+    seed_keywords: List[str],
+    trending_hashtags: List[str],
+    seo_keywords: List[str],
+) -> str:
+    """Generate a short, engaging caption for a social media post."""
+    hashtags_sample = random.sample(trending_hashtags, min(5, len(trending_hashtags))) if trending_hashtags else []
+    
+    prompt = (
+        f"Write an engaging social media caption about '{query}'. "
+        f"Use these keywords: {', '.join(seed_keywords)}. "
+        f"Include a few of these hashtags: {' '.join(hashtags_sample)}. "
+        f"The caption should be around 50 words, energetic, and conversational. "
+        f"Do NOT use em-dashes (—) or long formatting. Only return the caption text."
+    )
 
-    prompt = f"""Write an engaging social media caption with a strong opening hook for a post about '{query}'. 
-    Use these keywords: {', '.join(seed_keywords)}. Include some of these hashtags: 
-    {', '.join(random.sample(trending_hashtags, min(5, len(trending_hashtags))))}. 
-    Keep the caption around 50 words and do not use em-dashes (—)."""
     try:
-        completion = await client.chat.completions.create(
-            model="deepseek-r1-distill-llama-70b",
+        completion =  client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # ✅ use Groq’s main model
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_completion_tokens=1024,
-            reasoning_format="hidden",
+            temperature=0.7,
+            max_completion_tokens=150,  # 150 is more than enough for ~50 words
         )
-        return completion.choices[0].message.content
-
+        caption = completion.choices[0].message.content.strip()
+        return [kw.strip() for kw in caption.split(",")]
+        
+   
     except Exception as e:
-        logging.error(f"Error generating caption: {e}")
-        return "Sorry, I couldn't generate a caption at this time."
+        logger.error(f"Error generating seed keywords: {e}",exc_info=True)
+        return []
 
 
 async def generate_html_code_post(client: AsyncGroq, prompt: str, template_type: str) -> str:
@@ -1350,7 +1395,7 @@ async def generate_html_code_post(client: AsyncGroq, prompt: str, template_type:
     Generate a complete HTML document (<html>, <head>, <body>, etc.) styled similarly, only utf-8 characters with content relevant to: {prompt}. 
     Output only the HTML code."""
     try:
-        response = await client.chat.completions.create(
+        response =  client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
